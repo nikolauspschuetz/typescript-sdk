@@ -1,5 +1,13 @@
 # @modelcontextprotocol/codemod
 
+## 2.0.0-alpha.2
+
+### Patch Changes
+
+- [#2286](https://github.com/modelcontextprotocol/typescript-sdk/pull/2286) [`1823aae`](https://github.com/modelcontextprotocol/typescript-sdk/commit/1823aae891837ebb5e3db885ec635f9efefd5771) Thanks [@felixweinberger](https://github.com/felixweinberger)! - The v1→v2 codemod no longer rewrites `taskStore`/`taskMessageQueue` McpServer constructor options into `capabilities.tasks` — that target does not exist in v2 (the experimental tasks runtime was removed, SEP-2663). The codemod now leaves the code untouched and emits an action-required diagnostic telling migrators to remove the option, matching the removal guidance already given for `experimental/tasks` imports and the migration guide.
+
+- [#2286](https://github.com/modelcontextprotocol/typescript-sdk/pull/2286) [`1823aae`](https://github.com/modelcontextprotocol/typescript-sdk/commit/1823aae891837ebb5e3db885ec635f9efefd5771) Thanks [@felixweinberger](https://github.com/felixweinberger)! - v1-to-v2: now wraps `outputSchema` raw shapes with `z.object()`; importMap covers `sdk/server/express.js`, `sdk/server/middleware/hostHeaderValidation.js`, and `sdk/client/auth-extensions.js`. The unreachable `expressMiddleware` transform is removed.
+
 ## 2.0.0-alpha.1
 
 ### Minor Changes
