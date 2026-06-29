@@ -1,4 +1,5 @@
 import type { ChildProcess, IOType } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import process from 'node:process';
 import type { Stream } from 'node:stream';
 import { PassThrough } from 'node:stream';
@@ -135,6 +136,15 @@ export class StdioClientTransport implements Transport {
                 },
                 stdio: ['pipe', 'pipe', this._serverParams.stderr ?? 'inherit'],
                 shell: false,
+                // On POSIX, run the child as the leader of its own process group (pgid === pid)
+                // so that wrapper commands (npx/uvx/python -m/shells) and the real server they
+                // fork can be terminated together as a tree in close(). We keep stdio wired and do
+                // NOT call unref(): the transport still owns the child's lifecycle. Skipped on
+                // Windows, where `detached` opens a new console window instead.
+                // Tradeoff: a detached child no longer shares the parent's controlling terminal,
+                // so terminal SIGINT (Ctrl+C) is not auto-delivered to it, and an abrupt parent
+                // death that skips close() can orphan the tree.
+                detached: process.platform !== 'win32',
                 windowsHide: process.platform === 'win32',
                 cwd: this._serverParams.cwd
             });
@@ -235,22 +245,20 @@ export class StdioClientTransport implements Transport {
 
             await Promise.race([closePromise, new Promise(resolve => setTimeout(resolve, 2000).unref())]);
 
-            if (processToClose.exitCode === null) {
-                try {
-                    processToClose.kill('SIGTERM');
-                } catch {
-                    // ignore
-                }
+            // `exitCode` stays null both before exit AND after death-by-signal (where
+            // `signalCode` is set instead). Only escalate while the process is genuinely
+            // still running, so a server that terminates on SIGTERM does not trigger a
+            // pointless SIGKILL — and its descendant-tree walk — on the common close path.
+            const stillRunning = () => processToClose.exitCode === null && processToClose.signalCode === null;
+
+            if (stillRunning()) {
+                killProcessTree(processToClose, 'SIGTERM');
 
                 await Promise.race([closePromise, new Promise(resolve => setTimeout(resolve, 2000).unref())]);
             }
 
-            if (processToClose.exitCode === null) {
-                try {
-                    processToClose.kill('SIGKILL');
-                } catch {
-                    // ignore
-                }
+            if (stillRunning()) {
+                killProcessTree(processToClose, 'SIGKILL');
             }
         }
 
@@ -271,4 +279,98 @@ export class StdioClientTransport implements Transport {
             }
         });
     }
+}
+
+/**
+ * Terminate a child process together with any descendants it spawned.
+ *
+ * {@link StdioClientTransport} frequently launches wrapper commands (`npx`, `uvx`,
+ * `python -m`, shell scripts) that fork the real MCP server as a grandchild.
+ * {@link ChildProcess.kill} only signals the direct child, leaving the server
+ * orphaned; this helper signals the whole tree instead.
+ *
+ * - On POSIX the child is spawned `detached`, so it leads its own process group
+ *   (`pgid === pid`); signalling the negative pid reaches every member of the group.
+ *   If the group signal fails we fall back to a best-effort `pgrep -P` descendant walk
+ *   (which can miss descendants already reparented away from an exited leader), then the
+ *   direct child.
+ * - On Windows there is no process-group primitive, so we shell out to `taskkill /T`,
+ *   which terminates the pid and its entire child tree. The graceful pass (SIGTERM) uses a
+ *   soft taskkill and the SIGKILL pass adds `/F`, mirroring the POSIX escalation.
+ */
+function killProcessTree(proc: ChildProcess, signal: NodeJS.Signals): void {
+    const pid = proc.pid;
+    if (pid === undefined) {
+        return;
+    }
+
+    if (process.platform === 'win32') {
+        // Windows has no process-group primitive and Node's kill() cannot deliver POSIX
+        // signals there, so shell out to taskkill /T (whole tree). Map the graceful pass
+        // (SIGTERM) to a soft taskkill and reserve /F for the SIGKILL pass, mirroring the
+        // POSIX SIGTERM -> grace -> SIGKILL escalation. `timeout` bounds a hung taskkill.
+        const force = signal === 'SIGKILL';
+        const args = force ? ['/T', '/F', '/PID', String(pid)] : ['/T', '/PID', String(pid)];
+        const result = spawnSync('taskkill', args, { windowsHide: true, timeout: 2000 });
+        // Only fall back to a direct kill on the force pass. A soft taskkill legitimately
+        // fails for a console process with no window to receive the close request; killing
+        // just the direct child there would orphan the tree, so we let close() escalate to
+        // the SIGKILL pass instead.
+        if (force && (result.error || result.status !== 0)) {
+            killPid(proc, signal);
+        }
+        return;
+    }
+
+    try {
+        // A negative pid signals the entire process group led by the detached child.
+        process.kill(-pid, signal);
+        return;
+    } catch {
+        // Group signalling failed (e.g. the child was never a group leader, or the
+        // group is already gone); fall back to walking the descendant tree explicitly.
+    }
+
+    for (const descendant of collectDescendantPids(pid)) {
+        try {
+            process.kill(descendant, signal);
+        } catch {
+            // ignore processes that already exited
+        }
+    }
+
+    killPid(proc, signal);
+}
+
+/**
+ * Signal a single child process, swallowing errors (e.g. it already exited).
+ */
+function killPid(proc: ChildProcess, signal: NodeJS.Signals): void {
+    try {
+        proc.kill(signal);
+    } catch {
+        // ignore
+    }
+}
+
+/**
+ * Depth-first enumeration of a process's descendant pids via `pgrep -P`, ordered
+ * deepest-first so children are signalled before their parents.
+ */
+function collectDescendantPids(pid: number): number[] {
+    // `timeout` bounds a hung pgrep so close() can't block forever.
+    const result = spawnSync('pgrep', ['-P', String(pid)], { encoding: 'utf8', timeout: 2000 });
+    if (result.status !== 0 || typeof result.stdout !== 'string') {
+        return [];
+    }
+
+    const descendants: number[] = [];
+    for (const line of result.stdout.split('\n')) {
+        const childPid = Number.parseInt(line.trim(), 10);
+        if (!Number.isInteger(childPid) || childPid <= 0) {
+            continue;
+        }
+        descendants.push(...collectDescendantPids(childPid), childPid);
+    }
+    return descendants;
 }
